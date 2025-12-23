@@ -3,13 +3,21 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 
+// 内存分配策略枚举
+typedef enum {
+    STRATEGY_BEST_FIT = 0,
+    STRATEGY_QUICK_FIT = 1
+} allocation_strategy;
+
+// 内存块结构
 struct mem_block {
   size_t size;
   int is_free;
   size_t applyed_size;
   
-  // 用于快速适配桶的双向链表 (指针大小都是 8 字节)
+  // 用于快速适配桶的双向链表
   struct mem_block *prev;  // 在quick_lists中的前驱
   struct mem_block *next;  // 在quick_lists中的后继
   
@@ -19,7 +27,7 @@ struct mem_block {
 };
 
 // 接口声明
-void mem_init(size_t heap_size);
+void mem_init(size_t heap_size, allocation_strategy strategy);
 void* umalloc(size_t nbytes);
 void ufree(void *ptr);
 void fragmentation_stats(void);

@@ -1,19 +1,22 @@
+// umalloc.c
+
 #define _DEFAULT_SOURCE
 #include "umalloc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-#include <pthread.h>
 
 
-// ==================== 数据结构 ====================
+// ==================== 数据结构 ========================
+// 内存信息
 struct {
   pthread_mutex_t lock;  // 用户空间锁
   struct mem_block *globallist;  // 全局链表头指针，低地址到高地址排序
   size_t used_memory;
   size_t total_memory;
-} mem = {PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0};
+  allocation_strategy strategy;  // 内存分配策略
+} mem = {PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0, STRATEGY_BEST_FIT};
 
 
 // ==================== 常量工具函数 ====================
@@ -53,12 +56,24 @@ void remove_from_quick_list(struct mem_block *block) {
   block->next = NULL;
 }
 
+// 向快速链表添加块
+void add_to_quick_list(struct mem_block *block) {
+  if (!block) return;
+  int index = quick_list_index(block->size);
+
+  block->prev = NULL;
+  block->next = quick_lists[index];
+  if (quick_lists[index]) quick_lists[index]->prev = block;
+  quick_lists[index] = block;
+}
+
 // 扩展堆函数
 struct mem_block* extend_heap(size_t min_size) {
   size_t pgsize = sysconf(_SC_PAGESIZE);  // 获取系统页大小
   size_t extend_size = (min_size < pgsize) ? pgsize : ((min_size + pgsize - 1) & ~(pgsize - 1));  // 向上取整到页边界
   
   void *new_mem = sbrk(extend_size);  // 向内核申请内存
+  mem.total_memory += extend_size;  // 更新总内存大小
   if (new_mem == (void*)-1) return NULL;  // 内存不足
 
   // 初始化新内存块
@@ -81,12 +96,6 @@ struct mem_block* extend_heap(size_t min_size) {
     new_block->prev_global = curr;
   }
 
-  // 添加到快速链表
-  int index = quick_list_index(new_block->size);
-  new_block->next = quick_lists[index];
-  if (quick_lists[index]) quick_lists[index]->prev = new_block;
-  quick_lists[index] = new_block;
-
   printf("extend_heap: added %zu bytes at %p\n", extend_size, new_mem);
   return new_block;
 }
@@ -94,7 +103,7 @@ struct mem_block* extend_heap(size_t min_size) {
 
 // ==================== 初始化 =====================
 void
-mem_init(size_t heap_size) {
+mem_init(size_t heap_size, allocation_strategy strategy) {
   pthread_mutex_lock(&mem.lock);  // 获取锁
   // 如果已经初始化过了，直接解锁退出
   if (mem.total_memory > 0) {
@@ -102,13 +111,13 @@ mem_init(size_t heap_size) {
     return;
   }
   
-// 向内核申请内存
-    void *heap_start = sbrk(heap_size);
-    if (heap_start == (void*)-1) {
-        pthread_mutex_unlock(&mem.lock); // 失败解锁
-        perror("mem_init: sbrk failed");
-        exit(1);
-    }
+  // 向内核申请内存
+  void *heap_start = sbrk(heap_size);
+  if (heap_start == (void*)-1) {
+      pthread_mutex_unlock(&mem.lock); // 失败解锁
+      perror("mem_init: sbrk failed");
+      exit(1);
+  }
 
   // 初始化第一个内存块
   struct mem_block *first_block = (struct mem_block*)heap_start;
@@ -118,16 +127,20 @@ mem_init(size_t heap_size) {
   first_block->next_global = NULL;
   first_block->prev_global = NULL;
 
-  mem.globallist = first_block;
+  // 初始化全局链表
+  mem.strategy = strategy;  // 设置分配策略
+  mem.globallist = first_block;  // 全局链表头指针
   mem.total_memory = heap_size;
   mem.used_memory = 0;
 
-  // 初始化快速适配链表
-  init_quick_lists();
-  int index = quick_list_index(first_block->size);
-  first_block->prev = NULL;
-  first_block->next = NULL;
-  quick_lists[index] = first_block;
+  // 如果使用快速适配策略，需要初始化快速适配链表
+  if (mem.strategy == STRATEGY_QUICK_FIT) {
+    init_quick_lists();
+    add_to_quick_list(first_block);  // 加入快速链表
+  } else if (mem.strategy == STRATEGY_BEST_FIT) {
+    first_block->next = NULL;
+    first_block->prev = NULL;
+  }
 
   // 释放锁
   pthread_mutex_unlock(&mem.lock);
@@ -175,11 +188,7 @@ found:
     new_block->is_free = 1;
 
     // 插入剩余块到快速链表
-    int new_index = quick_list_index(new_block->size);
-    new_block->next = quick_lists[new_index];  // 将新块插入到快速链表中作为头指针
-    new_block->prev = NULL;
-    if (quick_lists[new_index]) quick_lists[new_index]->prev = new_block;
-    quick_lists[new_index] = new_block;
+    add_to_quick_list(new_block);
 
     // 修改全局链表
     new_block->prev_global = block;
@@ -197,7 +206,7 @@ found:
 }
 
 
-// ==================== 最佳适应分配===================
+// ==================== 最佳适应分配 ===================
 void*
 umalloc_best_fit(size_t nbytes) {
   if (nbytes <= 0) return NULL;
@@ -229,7 +238,6 @@ umalloc_best_fit(size_t nbytes) {
   // 分割块 (剩余空间足够大)：剩余空间 > 元数据大小 + 最小用户块
   best->is_free = 0;
   best->applyed_size = nbytes;  // 记录用户申请的大小
-  remove_from_quick_list(best);  // 从快速链表中摘除
   if (best->size > required_size + sizeof(struct mem_block) + 8) {
     // 设置并计算新块
     struct mem_block *new_block = (struct mem_block*)((char*)best + required_size);  // 在C语言中，指针加减法是以指向类型的大小为单位
@@ -243,13 +251,6 @@ umalloc_best_fit(size_t nbytes) {
     if (best->next_global) best->next_global->prev_global = new_block;
     best->next_global  = new_block;
     best->size = required_size;
-
-    // 新块添加到快速链表
-    int new_index = quick_list_index(new_block->size);
-    new_block->next = quick_lists[new_index];
-    new_block->prev = NULL;
-    if (quick_lists[new_index]) quick_lists[new_index]->prev = new_block;
-    quick_lists[new_index] = new_block;
   }
 
   mem.used_memory += best->size;
@@ -260,15 +261,53 @@ umalloc_best_fit(size_t nbytes) {
 
 
 // ==================== 内存释放 ===================
-void
-ufree(void *pa)
-{
-  if (pa == 0) return;
+// 向前合并
+static struct mem_block* merge_with_prev(struct mem_block *block) {
+    struct mem_block *prev = block->prev_global;
+    prev->size += block->size;
+    prev->next_global = block->next_global;
+    if (block->next_global) block->next_global->prev_global = prev;
+    return prev; // 返回合并后的指针
+}
 
+// 向后合并
+static struct mem_block* merge_with_next(struct mem_block *block) {
+    struct mem_block *next = block->next_global;
+    struct mem_block *next_next = next->next_global;
+    block->size += next->size;
+    block->next_global = next_next;
+    if (next_next) next_next->prev_global = block;
+    return block;
+}
+
+// Best Fit 的 Free
+void ufree_best_fit(struct mem_block *block) {
+  if (block->prev_global && block->prev_global->is_free) block = merge_with_prev(block);  // 合并前一个块
+  if (block->next_global && block->next_global->is_free) block = merge_with_next(block);  // 合并后一个块
+  block->next = block->prev = NULL;  // 清理无用的指针
+}
+
+// Quick Fit 的 Free
+void ufree_quick_fit(struct mem_block *block) {
+  remove_from_quick_list(block);  // 先移除自己
+  if (block->prev_global && block->prev_global->is_free) {
+    remove_from_quick_list(block->prev_global);  // 移除前一个块
+    block = merge_with_prev(block);  // 合并前一个块
+  }
+  if (block->next_global && block->next_global->is_free) {
+    remove_from_quick_list(block->next_global);  // 移除后一个块
+    block = merge_with_next(block);  // 合并后一个块
+  }
+  add_to_quick_list(block);  // 将释放的块加入快速链表
+}
+
+// 统一释放内存的分发器
+void
+ufree(void *pa) {
+  if (pa == 0) return;
   pthread_mutex_lock(&mem.lock);
 
   struct mem_block *block = GET_BLOCK(pa);
-
   // 安全检查
   if (block->is_free) {
       pthread_mutex_unlock(&mem.lock);
@@ -276,34 +315,15 @@ ufree(void *pa)
   }
 
   block->is_free = 1;  // 标记为空闲
-  remove_from_quick_list(block);  // 先移除自己
   mem.used_memory -= block->size;
   block->applyed_size = 0;  // 重置申请的大小
 
-  // 合并前一个空间块
-  if (block->prev_global && block->prev_global->is_free) {
-    remove_from_quick_list(block->prev_global);  // 从快速链表中移除前一个块
-    block->prev_global->size += block->size;
-    block->prev_global->next_global = block->next_global;
-    if (block->next_global) block->next_global->prev_global = block->prev_global;
-    block = block->prev_global;
+  // 根据策略分发
+  if (mem.strategy == STRATEGY_BEST_FIT) {
+    ufree_best_fit(block);
+  } else if (mem.strategy == STRATEGY_QUICK_FIT) {
+    ufree_quick_fit(block);
   }
-
-  // 合并后一个空间块
-  if (block->next_global && block->next_global->is_free) {
-    remove_from_quick_list(block->next_global);  // 从快速链表中移除后一个块
-    struct mem_block *next_next = block->next_global->next_global;
-    block->size += block->next_global->size; 
-    block->next_global = next_next;
-    if (next_next) next_next->prev_global = block;
-  }
-
-  // 更新快速链表
-  int index = quick_list_index(block->size);
-  block->next = quick_lists[index];
-  if (quick_lists[index]) quick_lists[index]->prev = block;
-  quick_lists[index] = block;
-  block->prev = 0;
 
   pthread_mutex_unlock(&mem.lock);
 }
@@ -410,9 +430,9 @@ visualize_memory() {
   printf("| Address        | Memory State                              |\n");
   printf("+------------------------------------------------------------+\n");
 
-  const size_t ROW_SIZE = 256;  // 每一行代表 256 字节的内存空间
-  const size_t CHAR_SCALE = 8;  // 每个字符代表 8 字节的内存空间
-  size_t rows = mem.total_memory / ROW_SIZE;  // 计算需要多少行
+  const size_t rows = 16;  // 设定可视化内存的行数
+  const size_t ROW_SIZE = mem.total_memory / rows;  // 每一行代表的内存空间
+  const size_t CHAR_SCALE = ROW_SIZE / 32;  // 每个字符代表的内存空间
   uintptr_t base = (uintptr_t)mem.globallist;  // 基地址
 
   for (size_t row = 0; row < rows; row++) {
@@ -452,11 +472,14 @@ visualize_memory() {
 void*
 umalloc(size_t nbytes)
 {
-  // 首次调用时初始化内存管理器
+  // 首次调用时初始化内存管理器 (选定策略)
   if (mem.total_memory == 0) {
-    mem_init(4096);
+    mem_init(4096, STRATEGY_BEST_FIT);
+    // mem_init(4096, STRATEGY_QUICK_FIT);
   }
 
-  // return umalloc_best_fit(nbytes);  // 使用最佳适应分配
-  return umalloc_quick_fit(nbytes);  // 使用快速适配分配
+  if (mem.strategy == STRATEGY_BEST_FIT) return umalloc_best_fit(nbytes);  // 使用最佳适应分配
+  else if (mem.strategy == STRATEGY_QUICK_FIT) return umalloc_quick_fit(nbytes);  // 使用快速适配分配
+
+  return NULL;
 }
